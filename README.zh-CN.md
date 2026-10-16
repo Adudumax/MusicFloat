@@ -47,15 +47,20 @@ MusicFloat 提供深色桌面控制面板，包含当前播放、悬浮窗设置
 
 请在 [GitHub Releases](https://github.com/Adudumax/MusicFloat/releases/latest) 页面下载最新的 Windows x64 便携版。
 
-v1.2.4 的 Windows x64 便携包已内置 .NET 运行时，无需安装程序，也无需另外安装 .NET Desktop Runtime。
+MusicFloat 本身不需要安装程序，但必须先安装 .NET 8 Desktop Runtime（x64）。
+
+微软官方下载页面：https://dotnet.microsoft.com/en-us/download/dotnet/8.0/runtime
+
+打开页面后，请选择 **.NET Desktop Runtime 8.x - Windows x64**。
 
 ## 快速开始
 
-1. 下载最新的 `MusicFloat-vX.Y.Z-win-x64.zip` 发布资产。
-2. 将 ZIP 解压到你自己的文件夹。
-3. 先退出旧版本的 MusicFloat，再运行新版 `MusicFloat.exe`。
-4. 在支持 SMTC 的播放器中开始播放音乐。
-5. 在控制面板中刷新来源、测试悬浮窗、调整悬浮窗设置并绑定快捷键。
+1. 如果尚未安装 .NET 8 Desktop Runtime（x64），请先安装。
+2. 下载最新的 `MusicFloat-vX.Y.Z-win-x64.zip` 发布资产。
+3. 将 ZIP 解压到你自己的文件夹。
+4. 先退出旧版本的 MusicFloat，再运行新版 `MusicFloat.exe`。
+5. 在支持 SMTC 的播放器中开始播放音乐。
+6. 在控制面板中刷新来源、测试悬浮窗、调整悬浮窗设置并绑定快捷键。
 
 ## 键盘和手柄控制
 
