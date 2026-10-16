@@ -5,6 +5,17 @@ namespace AppleMusicOverlay.Tests;
 
 public sealed class OverlayTrackChangeDisplayPolicyTests
 {
+    [Theory]
+    [InlineData(true, false, true, true)]
+    [InlineData(false, false, true, false)]
+    [InlineData(true, true, true, false)]
+    [InlineData(true, false, false, false)]
+    public void SourceRecoveryOnlyReshowsHiddenPersistentOverlayWithReadyCover(bool keepVisible, bool visible, bool hasCover, bool expected)
+    {
+        var track = new TrackInfo("Song", "Artist", hasCover ? [1] : null, "AppleMusic", TimeSpan.FromMinutes(3), true);
+        Assert.Equal(expected, OverlayTrackChangeDisplayPolicy.ShouldRestorePersistentOverlay(keepVisible, visible, track));
+    }
+
     [Fact]
     public void EnabledSettingPreservesAutomaticShowBehavior()
     {

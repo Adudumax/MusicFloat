@@ -141,14 +141,13 @@ public sealed class TrackMonitorTests
         var first = new TrackInfo("First", "Artist", oldCover, "AppleMusic", TimeSpan.FromMinutes(3), true);
         var secondWithOldCover = new TrackInfo("Second", "Artist", oldCover, "AppleMusic", TimeSpan.FromMinutes(3), true);
         var secondWithFreshCover = secondWithOldCover with { CoverBytes = freshCover };
-        var service = new FakeMediaSessionService(first, first, secondWithOldCover, secondWithOldCover, secondWithFreshCover);
-        var monitor = new TrackMonitor(service, settleDelay: TimeSpan.Zero);
+        var service = new FakeMediaSessionService(first, secondWithOldCover, secondWithOldCover, secondWithFreshCover);
+        var monitor = new TrackMonitor(service, settleDelay: TimeSpan.FromMilliseconds(40));
         var changes = new List<TrackInfo>();
         var refreshes = new List<TrackInfo>();
         monitor.TrackChanged += (_, track) => changes.Add(track);
         monitor.TrackRefreshed += (_, track) => refreshes.Add(track);
 
-        await monitor.PollOnceAsync();
         await monitor.PollOnceAsync();
         await monitor.PollOnceAsync();
 
@@ -157,7 +156,7 @@ public sealed class TrackMonitorTests
     }
 
     [Fact]
-    public async Task CloudMusicWaitsForNewCoverWithoutReusingPreviousCover()
+    public async Task CloudMusicAllowsSharedHighResolutionArtworkAfterSettling()
     {
         byte[] oldCover = CreateBmp(768, 768);
         var first = new TrackInfo(
@@ -186,9 +185,67 @@ public sealed class TrackMonitorTests
         await monitor.PollOnceAsync();
         await monitor.PollOnceAsync();
 
-        Assert.Equal([first], changes);
+        Assert.Equal([first, secondWithOldCover], changes);
         Assert.Equal("Second", monitor.CurrentTrack?.Title);
-        Assert.Null(monitor.CurrentTrack?.CoverBytes);
+        Assert.Equal(oldCover, monitor.CurrentTrack?.CoverBytes);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(40)]
+    public async Task AlbumTracksSharingArtworkCanMoveForwardAndBackWithoutFreezing(int settleMilliseconds)
+    {
+        var first = new TrackInfo("Album Track 1", "Artist", [1], "AppleMusic", TimeSpan.FromMinutes(3), true);
+        var second = first with { Title = "Album Track 2" };
+        var third = first with { Title = "Album Track 3" };
+        var service = new MutableMediaSessionService(first);
+        using var monitor = new TrackMonitor(service, settleDelay: TimeSpan.FromMilliseconds(settleMilliseconds));
+        var changes = new List<TrackInfo>();
+        monitor.TrackChanged += (_, track) => changes.Add(track);
+
+        foreach (TrackInfo track in new[] { first, second, third, second, first })
+        {
+            service.Track = track;
+            await monitor.PollOnceAsync();
+            Assert.Equal(track, monitor.CurrentTrack);
+        }
+        await monitor.PollOnceAsync();
+        Assert.Equal([first, second, third, second, first], changes);
+    }
+
+    [Fact]
+    public async Task ArtworkArrivingAfterSharedCoverSettleRefreshesWithoutSecondTrackChange()
+    {
+        var first = new TrackInfo("First", "Artist", [1], "AppleMusic", TimeSpan.FromMinutes(3), true);
+        var second = first with { Title = "Second" };
+        var updated = second with { CoverBytes = [2] };
+        var service = new MutableMediaSessionService(first);
+        using var monitor = new TrackMonitor(service, settleDelay: TimeSpan.Zero);
+        var changes = new List<TrackInfo>();
+        var refreshes = new List<TrackInfo>();
+        monitor.TrackChanged += (_, track) => changes.Add(track);
+        monitor.TrackRefreshed += (_, track) => refreshes.Add(track);
+        await monitor.PollOnceAsync();
+        service.Track = second;
+        await monitor.PollOnceAsync();
+        service.Track = updated;
+        await monitor.PollOnceAsync();
+        Assert.Equal([first, second], changes);
+        Assert.Equal([updated], refreshes);
+        Assert.Equal(updated, monitor.CurrentTrack);
+    }
+
+    [Fact]
+    public async Task SharedArtworkStopsFullCoverReadsAfterBoundedFollowup()
+    {
+        var first = new TrackInfo("First", "Artist", [1], "AppleMusic", TimeSpan.FromMinutes(3), true);
+        var service = new MutableMediaSessionService(first);
+        using var monitor = new TrackMonitor(service, settleDelay: TimeSpan.Zero);
+        await monitor.PollOnceAsync();
+        service.Track = first with { Title = "Second" };
+        await monitor.PollOnceAsync();
+        for (int i = 0; i < 8; i++) await monitor.PollOnceAsync();
+        Assert.All(service.IncludeCoverRequests.TakeLast(5), includeCover => Assert.False(includeCover));
     }
 
     [Fact]
@@ -310,10 +367,10 @@ public sealed class TrackMonitorTests
     }
 
     [Fact]
-    public async Task ConfirmedMissingSessionRaisesUnavailableAndAllowsSameTrackToReturn()
+    public async Task TransientMissingSessionKeepsCurrentTrackAndDoesNotReplaySameTrackChange()
     {
         var track = new TrackInfo("Song", "Artist", [1], "AppleMusic", TimeSpan.FromMinutes(3), true);
-        var service = new FakeMediaSessionService(track, track, null, track, track);
+        var service = new FakeMediaSessionService(track, track, null, track);
         var monitor = new TrackMonitor(service, settleDelay: TimeSpan.Zero);
         var changes = new List<TrackInfo>();
         int unavailableCount = 0;
@@ -322,11 +379,81 @@ public sealed class TrackMonitorTests
 
         await monitor.PollOnceAsync();
         await monitor.PollOnceAsync();
+        Assert.Equal(track, monitor.CurrentTrack);
+        await monitor.PollOnceAsync();
+
+        Assert.Equal(0, unavailableCount);
+        Assert.Equal([track], changes);
+    }
+
+    [Fact]
+    public async Task ConsecutiveMissingSessionReadsConfirmUnavailableWithoutReplayingSameTrackChange()
+    {
+        var track = new TrackInfo("Song", "Artist", [1], "AppleMusic", TimeSpan.FromMinutes(3), true);
+        var service = new FakeMediaSessionService(track, track, null, null, track, track);
+        var monitor = new TrackMonitor(service, settleDelay: TimeSpan.Zero);
+        var changes = new List<TrackInfo>();
+        int unavailableCount = 0;
+        monitor.TrackChanged += (_, changedTrack) => changes.Add(changedTrack);
+        monitor.TrackUnavailable += (_, _) => unavailableCount++;
+
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        Assert.Equal(track, monitor.CurrentTrack);
+        await monitor.PollOnceAsync();
         Assert.Null(monitor.CurrentTrack);
         await monitor.PollOnceAsync();
 
         Assert.Equal(1, unavailableCount);
-        Assert.Equal([track, track], changes);
+        Assert.Equal(track, monitor.CurrentTrack);
+        Assert.Equal([track], changes);
+    }
+
+    [Fact]
+    public async Task DifferentTrackAfterConfirmedUnavailableStillRaisesTrackChanged()
+    {
+        var first = new TrackInfo("First", "Artist", [1], "AppleMusic", TimeSpan.FromMinutes(3), true);
+        var second = new TrackInfo("Second", "Artist", [2], "AppleMusic", TimeSpan.FromMinutes(4), true);
+        var service = new FakeMediaSessionService(first, first, null, null, second, second);
+        var monitor = new TrackMonitor(service, settleDelay: TimeSpan.Zero);
+        var changes = new List<TrackInfo>();
+        monitor.TrackChanged += (_, changedTrack) => changes.Add(changedTrack);
+
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+
+        Assert.Equal(second, monitor.CurrentTrack);
+        Assert.Equal([first, second], changes);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SameTrackRecoveryRaisesRestoredWithoutAutomaticTrackChangeEvenWhenArtistArrives(bool artistArrives)
+    {
+        var first = new TrackInfo("Song", artistArrives ? "" : "Artist", [1], "AppleMusic", TimeSpan.FromMinutes(3), true);
+        var restored = first with { Artist = "Artist" };
+        var service = new FakeMediaSessionService(first, first, null, null, null, restored, restored);
+        using var monitor = new TrackMonitor(service, settleDelay: TimeSpan.Zero);
+        var changes = new List<TrackInfo>();
+        var recoveries = new List<TrackInfo>();
+        int unavailable = 0;
+        monitor.TrackChanged += (_, track) => changes.Add(track);
+        monitor.TrackRestored += (_, track) => recoveries.Add(track);
+        monitor.TrackUnavailable += (_, _) => unavailable++;
+
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+
+        Assert.Equal(1, unavailable);
+        Assert.Equal([first], changes);
+        Assert.Equal([restored], recoveries);
+        Assert.Equal(restored, monitor.CurrentTrack);
     }
 
     [Fact]
@@ -339,6 +466,23 @@ public sealed class TrackMonitorTests
         await monitor.PollOnceAsync();
 
         Assert.Equal(0, unavailableCount);
+    }
+
+    [Fact]
+    public async Task RecoveryWaitsForCoverAndStillNotifiesWhenSameCoverArrivesLater()
+    {
+        var track = new TrackInfo("Song", "Artist", [1], "AppleMusic", TimeSpan.FromMinutes(3), true);
+        var service = new FakeMediaSessionService(track, track, null, null, track with { CoverBytes = null }, track);
+        using var monitor = new TrackMonitor(service, settleDelay: TimeSpan.Zero);
+        var restored = new List<TrackInfo>();
+        monitor.TrackRestored += (_, value) => restored.Add(value);
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        await monitor.PollOnceAsync();
+        Assert.Empty(restored);
+        await monitor.PollOnceAsync();
+        Assert.Equal([track], restored);
     }
 
     [Fact]
@@ -424,6 +568,22 @@ public sealed class TrackMonitorTests
 
         public Task PreviousAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 
+        public Task TogglePlayPauseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+    }
+
+    private sealed class MutableMediaSessionService(TrackInfo track) : IMediaSessionService
+    {
+        public TrackInfo Track { get; set; } = track;
+        public List<bool> IncludeCoverRequests { get; } = new();
+        public Task<TrackInfo?> GetCurrentTrackAsync(CancellationToken cancellationToken = default) =>
+            GetCurrentTrackAsync(MediaSessionReadOptions.Full, cancellationToken);
+        public Task<TrackInfo?> GetCurrentTrackAsync(MediaSessionReadOptions options, CancellationToken cancellationToken = default)
+        {
+            IncludeCoverRequests.Add(options.IncludeCover);
+            return Task.FromResult<TrackInfo?>(options.IncludeCover ? Track : Track with { CoverBytes = null });
+        }
+        public Task NextAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task PreviousAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task TogglePlayPauseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 

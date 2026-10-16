@@ -47,20 +47,15 @@ MusicFloat provides a dark desktop control panel with pages for current playback
 
 Download the latest portable Windows x64 build from the [GitHub Releases](https://github.com/Adudumax/MusicFloat/releases/latest) page.
 
-No installer is required for MusicFloat itself, but the .NET 8 Desktop Runtime (x64) must be installed.
-
-MusicFloat requires the .NET 8 Desktop Runtime (x64). Download it from Microsoft: https://dotnet.microsoft.com/en-us/download/dotnet/8.0/runtime
-
-On the download page, choose **.NET Desktop Runtime 8.x - Windows x64**.
+The v1.2.4 portable Windows x64 package includes the .NET runtime. No installer or separate .NET Desktop Runtime installation is required.
 
 ## Quick Start
 
-1. Install the .NET 8 Desktop Runtime (x64) if it is not already installed.
-2. Download the latest `MusicFloat-vX.Y.Z-win-x64.zip` release asset.
-3. Extract the ZIP to a folder you control.
-4. Run `MusicFloat.exe`.
-5. Start playback in a supported SMTC media player.
-6. Use the control panel to refresh sources, test the overlay, configure overlay behavior, and bind shortcuts.
+1. Download the latest `MusicFloat-vX.Y.Z-win-x64.zip` release asset.
+2. Extract the ZIP to a folder you control.
+3. Exit any older MusicFloat process, then run the new `MusicFloat.exe`.
+4. Start playback in a supported SMTC media player.
+5. Use the control panel to refresh sources, test the overlay, configure overlay behavior, and bind shortcuts.
 
 ## Keyboard and Gamepad Controls
 

@@ -6,13 +6,16 @@ namespace AppleMusicOverlay.Services;
 public sealed class GamepadInputService : IDisposable
 {
     private static readonly TimeSpan ReadInterval = TimeSpan.FromMilliseconds(1000d / 60d);
+    private static readonly IReadOnlySet<GamepadButton> EmptyButtons = new HashSet<GamepadButton>();
 
     private readonly object _syncRoot = new();
     private readonly Dictionary<string, Gamepad> _standardGamepadsByRuntimeId = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, RawGamepadInput> _rawGamepadsByRuntimeId = new(StringComparer.Ordinal);
     private readonly SynchronizationContext? _syncContext;
     private readonly XInputGamepadReader _xInputReader = new();
     private GamepadButtonReader _buttonReader = new();
     private CancellationTokenSource? _readLoopCts;
+    private Task? _readLoopTask;
     private bool _started;
     private bool _disposed;
     private List<GamepadDeviceInfo> _devices = new();
@@ -78,7 +81,7 @@ public sealed class GamepadInputService : IDisposable
         {
             lock (_syncRoot)
             {
-                return _readLoopCts != null;
+                return _readLoopCts != null && _readLoopTask is { IsCompleted: false };
             }
         }
     }
@@ -104,6 +107,15 @@ public sealed class GamepadInputService : IDisposable
     {
         ThrowIfDisposed();
         IReadOnlyList<GamepadDeviceInfo> devices = EnumerateDevices(out Dictionary<string, Gamepad> standardGamepadsByRuntimeId);
+        var rawGamepadsByRuntimeId = new Dictionary<string, RawGamepadInput>(StringComparer.Ordinal);
+        foreach (RawGameController raw in RawGameController.RawGameControllers)
+        {
+            string runtimeId = GetRawRuntimeId(raw);
+            if (!standardGamepadsByRuntimeId.ContainsKey(runtimeId))
+            {
+                rawGamepadsByRuntimeId[runtimeId] = new RawGamepadInput(raw);
+            }
+        }
         bool changed;
         lock (_syncRoot)
         {
@@ -113,6 +125,11 @@ public sealed class GamepadInputService : IDisposable
             foreach ((string runtimeId, Gamepad gamepad) in standardGamepadsByRuntimeId)
             {
                 _standardGamepadsByRuntimeId[runtimeId] = gamepad;
+            }
+            _rawGamepadsByRuntimeId.Clear();
+            foreach (var (runtimeId, rawGamepad) in rawGamepadsByRuntimeId)
+            {
+                _rawGamepadsByRuntimeId[runtimeId] = rawGamepad;
             }
 
             string? previousSelectedRuntimeId = _selectedRuntimeId;
@@ -178,6 +195,7 @@ public sealed class GamepadInputService : IDisposable
             StopReadLoopLocked();
             _devices.Clear();
             _standardGamepadsByRuntimeId.Clear();
+            _rawGamepadsByRuntimeId.Clear();
             _selectedRuntimeId = null;
             _selectedXInputSlot = null;
             ResetSelectedButtonsLocked();
@@ -277,78 +295,86 @@ public sealed class GamepadInputService : IDisposable
             return;
         }
 
-        if (_readLoopCts != null)
+        if (_readLoopTask is { IsCompleted: false })
         {
             return;
         }
 
-        _readLoopCts = new CancellationTokenSource();
-        _ = Task.Run(() => ReadLoopAsync(_readLoopCts.Token));
+        var cts = new CancellationTokenSource();
+        _readLoopCts = cts;
+        _readLoopTask = Task.Run(() => ReadLoopAsync(cts));
     }
 
     private void StopReadLoopLocked()
     {
         _readLoopCts?.Cancel();
-        _readLoopCts?.Dispose();
         _readLoopCts = null;
+        _readLoopTask = null;
     }
 
-    private async Task ReadLoopAsync(CancellationToken cancellationToken)
+    private async Task ReadLoopAsync(CancellationTokenSource cts)
     {
-        using var timer = new PeriodicTimer(ReadInterval);
         try
         {
-            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
-            {
-                Gamepad? selectedGamepad;
-                GamepadDeviceInfo? selectedDevice;
-                int? previousXInputSlot;
-                lock (_syncRoot)
-                {
-                    selectedDevice = _devices.FirstOrDefault(device => device.RuntimeId == _selectedRuntimeId);
-                    previousXInputSlot = _selectedXInputSlot;
-                    selectedGamepad = _selectedRuntimeId != null &&
-                                      _standardGamepadsByRuntimeId.TryGetValue(_selectedRuntimeId, out Gamepad? gamepad)
-                        ? gamepad
-                        : null;
-                }
-
-                if (selectedDevice?.Kind == GamepadDeviceKind.Xbox)
-                {
-                    IReadOnlyList<XInputControllerSnapshot> slots = _xInputReader.ReadSlots();
-                    XInputControllerSnapshot? selectedSlot = SelectXInputSlot(slots, previousXInputSlot);
-                    if (selectedSlot == null)
-                    {
-                        UpdateSelectedXInputSlot(null);
-                        UpdateCurrentButtons(new HashSet<GamepadButton>());
-                        continue;
-                    }
-
-                    if (selectedSlot.Slot != previousXInputSlot)
-                    {
-                        _xInputReader.ResetSlot(selectedSlot.Slot);
-                        UpdateSelectedXInputSlot(selectedSlot.Slot);
-                        UpdateCurrentButtons(new HashSet<GamepadButton>());
-                    }
-
-                    UpdateCurrentButtons(selectedSlot.Buttons);
-                    continue;
-                }
-
-                if (selectedGamepad == null)
-                {
-                    UpdateSelectedXInputSlot(null);
-                    UpdateCurrentButtons(new HashSet<GamepadButton>());
-                    continue;
-                }
-
-                IReadOnlySet<GamepadButton> pressed = _buttonReader.Read(selectedGamepad.GetCurrentReading());
-                UpdateSelectedXInputSlot(null);
-                UpdateCurrentButtons(pressed);
-            }
+            await GamepadPollingLoop.RunAsync(
+                ReadSelectedDevice,
+                () => { UpdateCurrentButtons(EmptyButtons); RefreshDevicesSafely(); },
+                ReadInterval,
+                cts.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
+        }
+        finally
+        {
+            lock (_syncRoot)
+            {
+                if (ReferenceEquals(_readLoopCts, cts))
+                {
+                    _readLoopCts = null;
+                    _readLoopTask = null;
+                }
+            }
+            cts.Dispose();
+        }
+    }
+
+    private void ReadSelectedDevice()
+    {
+        // Keep device selection and reader state consistent across hot-plug/reset operations.
+        lock (_syncRoot)
+        {
+            GamepadDeviceInfo? selectedDevice = _devices.FirstOrDefault(device => device.RuntimeId == _selectedRuntimeId);
+            if (selectedDevice == null) return;
+            if (selectedDevice.Kind == GamepadDeviceKind.Xbox)
+            {
+                XInputControllerSnapshot? slot = SelectXInputSlot(_xInputReader.ReadSlots(), _selectedXInputSlot);
+                if (slot != null)
+                {
+                    if (slot.Slot != _selectedXInputSlot)
+                    {
+                        _xInputReader.ResetSlot(slot.Slot);
+                        _selectedXInputSlot = slot.Slot;
+                        UpdateCurrentButtons(EmptyButtons);
+                    }
+                    UpdateCurrentButtons(slot.Buttons);
+                    return;
+                }
+            }
+
+            _selectedXInputSlot = null;
+            if (_standardGamepadsByRuntimeId.TryGetValue(selectedDevice.RuntimeId, out Gamepad? gamepad))
+            {
+                UpdateCurrentButtons(_buttonReader.Read(gamepad.GetCurrentReading()));
+            }
+            else if (_rawGamepadsByRuntimeId.TryGetValue(selectedDevice.RuntimeId, out RawGamepadInput? raw))
+            {
+                UpdateCurrentButtons(raw.Read());
+            }
+            else
+            {
+                UpdateCurrentButtons(EmptyButtons);
+            }
         }
     }
 
@@ -392,15 +418,16 @@ public sealed class GamepadInputService : IDisposable
     private void UpdateCurrentButtons(IReadOnlySet<GamepadButton> pressed)
     {
         bool changed;
-        IReadOnlySet<GamepadButton> snapshot = pressed.ToHashSet();
+        IReadOnlySet<GamepadButton> snapshot;
         lock (_syncRoot)
         {
-            changed = !_currentSelectedButtons.SetEquals(snapshot);
+            changed = !_currentSelectedButtons.SetEquals(pressed);
             if (!changed)
             {
                 return;
             }
 
+            snapshot = pressed.Count == 0 ? EmptyButtons : pressed.ToHashSet();
             _currentSelectedButtons = snapshot;
         }
 
@@ -418,14 +445,6 @@ public sealed class GamepadInputService : IDisposable
     private void RaiseSelectedButtonsChanged(IReadOnlySet<GamepadButton> pressed)
     {
         SelectedButtonsChanged?.Invoke(this, new GamepadButtonsChangedEventArgs(pressed));
-    }
-
-    private void UpdateSelectedXInputSlot(int? slot)
-    {
-        lock (_syncRoot)
-        {
-            _selectedXInputSlot = slot;
-        }
     }
 
     private static XInputControllerSnapshot? SelectXInputSlot(IReadOnlyList<XInputControllerSnapshot> slots, int? preferredSlot)

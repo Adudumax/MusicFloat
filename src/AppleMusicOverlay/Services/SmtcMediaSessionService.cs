@@ -186,7 +186,13 @@ public sealed class SmtcMediaSessionService : IMediaSessionService, IMediaSessio
 
             _manager = manager;
             _manager.SessionsChanged += (_, _) => RaiseMediaSessionChanged();
-            _manager.CurrentSessionChanged += (_, _) => RaiseMediaSessionChanged();
+            _manager.CurrentSessionChanged += (_, _) =>
+            {
+                if (MediaSessionChangeFilter.ShouldNotifyForCurrentSession(PreferredSourceAppUserModelId))
+                {
+                    RaiseMediaSessionChanged();
+                }
+            };
             return _manager;
         }
     }
@@ -202,9 +208,36 @@ public sealed class SmtcMediaSessionService : IMediaSessionService, IMediaSessio
                     continue;
                 }
 
-                session.MediaPropertiesChanged += (_, _) => RaiseMediaSessionChanged();
-                session.PlaybackInfoChanged += (_, _) => RaiseMediaSessionChanged();
+                session.MediaPropertiesChanged += (_, _) => RaiseMediaSessionChangedForSession(session);
+                session.PlaybackInfoChanged += (_, _) => RaiseMediaSessionChangedForSession(session);
             }
+        }
+    }
+
+    private void RaiseMediaSessionChangedForSession(GlobalSystemMediaTransportControlsSession session)
+    {
+        string preferredSourceAppUserModelId = PreferredSourceAppUserModelId;
+        if (string.IsNullOrWhiteSpace(preferredSourceAppUserModelId))
+        {
+            RaiseMediaSessionChanged();
+            return;
+        }
+
+        string sourceAppUserModelId;
+        try
+        {
+            sourceAppUserModelId = session.SourceAppUserModelId;
+        }
+        catch
+        {
+            return;
+        }
+
+        if (MediaSessionChangeFilter.ShouldNotifyForSession(
+                preferredSourceAppUserModelId,
+                sourceAppUserModelId))
+        {
+            RaiseMediaSessionChanged();
         }
     }
 

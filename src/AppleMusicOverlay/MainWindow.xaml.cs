@@ -225,6 +225,7 @@ public partial class MainWindow : Window, IHotkeySnapshotRegistrar
         _trackMonitor.TrackChanged += (_, track) => PostToDispatcher(() => _ = ShowOverlayTrackAsync(track));
         _trackMonitor.TrackRefreshed += (_, track) => PostToDispatcher(() => UpdateOverlayTrack(track));
         _trackMonitor.TrackUnavailable += (_, _) => PostToDispatcher(HideRuntimeOverlayForUnavailableSource);
+        _trackMonitor.TrackRestored += (_, track) => PostToDispatcher(() => RestorePersistentOverlay(track));
         _hotkeyService.HotkeyPressed += HotkeyService_HotkeyPressed;
         UpdateMaximizeButtonGlyph();
         ApplyWindowShellState();
@@ -2834,6 +2835,17 @@ public partial class MainWindow : Window, IHotkeySnapshotRegistrar
         _overlayRenderMode = OverlayRenderMode.Hidden;
         _layeredOverlayTrack = track;
         _layeredOverlayFavoriteState = OverlayFavoriteVisualState.Unavailable;
+    }
+
+    private void RestorePersistentOverlay(TrackInfo track)
+    {
+        if (OverlayTrackChangeDisplayPolicy.ShouldRestorePersistentOverlay(
+                _viewModel.Settings.PauseOverlay,
+                _layeredOverlayWindow.IsVisible || _overlayRenderMode is OverlayRenderMode.WpfSettingsPreview or OverlayRenderMode.WpfPositionEdit,
+                track) && IsCurrentTrack(track))
+        {
+            _ = ShowOverlayTrackAsync(track);
+        }
     }
 
     private void HideRuntimeOverlayForUnavailableSource()

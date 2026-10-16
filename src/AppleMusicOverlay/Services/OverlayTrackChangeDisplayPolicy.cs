@@ -11,6 +11,11 @@ public enum OverlayTrackChangeDisplayDecision
 
 public static class OverlayTrackChangeDisplayPolicy
 {
+    public static bool ShouldRestorePersistentOverlay(bool keepVisible, bool isOverlayVisible, TrackInfo track)
+    {
+        return keepVisible && !isOverlayVisible && track.CoverBytes is { Length: > 0 };
+    }
+
     public static OverlayTrackChangeDisplayDecision Decide(
         bool showOnTrackChange,
         bool pauseOverlay,

@@ -7,9 +7,12 @@ public sealed class TrackMonitor : IDisposable
 {
     private static readonly TimeSpan SettleProbeInterval = TimeSpan.FromMilliseconds(40);
     private const int StableCoverRefreshPolls = 30;
+    private const int SharedCoverRefreshPolls = 3;
+    private const int MissingSessionConfirmationReads = 2;
     private readonly IMediaSessionService _mediaSessionService;
     private readonly IMediaSessionChangeNotifier? _changeNotifier;
     private readonly object _wakeLock = new();
+    private readonly SemaphoreSlim _pollGate = new(1, 1);
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _stablePollInterval;
     private readonly TimeSpan _settleDelay;
@@ -20,7 +23,12 @@ public sealed class TrackMonitor : IDisposable
     private string? _lastCoverKey;
     private string? _pendingTrackKey;
     private TrackInfo? _lastStableTrack;
+    private TrackInfo? _lastPublishedTrack;
+    private bool _isUnavailable;
+    private bool _restoreNotificationPending;
     private int _stableMetadataOnlyPolls;
+    private int _sharedCoverRefreshPollsRemaining;
+    private int _consecutiveMissingSessionReads;
     private bool _disposed;
 
     public event EventHandler<TrackInfo?>? TrackRead;
@@ -30,6 +38,7 @@ public sealed class TrackMonitor : IDisposable
     public event EventHandler<TrackInfo>? TrackRefreshed;
 
     public event EventHandler? TrackUnavailable;
+    public event EventHandler<TrackInfo>? TrackRestored;
 
     public TrackInfo? CurrentTrack => _lastStableTrack;
 
@@ -66,6 +75,20 @@ public sealed class TrackMonitor : IDisposable
     public async Task PollOnceAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        await _pollGate.WaitAsync(cancellationToken);
+        try
+        {
+            ThrowIfDisposed();
+            await PollCoreAsync(cancellationToken);
+        }
+        finally
+        {
+            _pollGate.Release();
+        }
+    }
+
+    private async Task PollCoreAsync(CancellationToken cancellationToken)
+    {
         TrackInfo? track;
         bool includeCover = ShouldIncludeCoverOnNextRead();
         try
@@ -78,22 +101,36 @@ public sealed class TrackMonitor : IDisposable
         }
         catch
         {
-            TrackRead?.Invoke(this, null);
+            _consecutiveMissingSessionReads = 0;
+            TrackRead?.Invoke(this, _lastStableTrack);
             return;
         }
 
         if (track == null)
         {
+            if (_lastStableTrack != null &&
+                ++_consecutiveMissingSessionReads < MissingSessionConfirmationReads)
+            {
+                TrackRead?.Invoke(this, _lastStableTrack);
+                return;
+            }
+
+            _consecutiveMissingSessionReads = 0;
             _pendingTrackKey = null;
-            _lastTrackKey = null;
-            _lastCoverKey = null;
             _lastStableTrack = null;
             _stableMetadataOnlyPolls = 0;
+            _sharedCoverRefreshPollsRemaining = 0;
             TrackRead?.Invoke(this, null);
-            TrackUnavailable?.Invoke(this, EventArgs.Empty);
+            if (!_isUnavailable)
+            {
+                _isUnavailable = true;
+                _restoreNotificationPending = true;
+                TrackUnavailable?.Invoke(this, EventArgs.Empty);
+            }
             return;
         }
 
+        _consecutiveMissingSessionReads = 0;
         track = NormalizeCoverForSource(NormalizeTrack(track));
         bool alreadySettledTrack = false;
         if (!includeCover && HasTrackIdentityChanged(track))
@@ -126,7 +163,8 @@ public sealed class TrackMonitor : IDisposable
 
         if (trackChanged)
         {
-            if (!alreadySettledTrack)
+            if (!alreadySettledTrack ||
+                (_settleDelay > TimeSpan.Zero && !IsReadyToDisplay(track, _lastCoverKey)))
             {
                 track = NormalizeCoverForSource(
                     NormalizeTrack(await SettleTrackAsync(
@@ -152,12 +190,10 @@ public sealed class TrackMonitor : IDisposable
                 return;
             }
 
-            track = RemovePreviousCover(track, _lastCoverKey);
-            coverKey = CreateCoverKey(track);
             if (!HasCover(track))
             {
                 _pendingTrackKey = trackKey;
-                if (isCloudMusicTrack)
+                if (OverlayFavoritePresentation.IsSupportedCloudMusicSource(track.SourceAppId))
                 {
                     _lastTrackKey = trackKey;
                     _lastCoverKey = string.Empty;
@@ -175,6 +211,7 @@ public sealed class TrackMonitor : IDisposable
                 _pendingTrackKey = null;
                 if (coverKey != _lastCoverKey && track.CoverBytes is { Length: > 0 })
                 {
+                    _sharedCoverRefreshPollsRemaining = 0;
                     _lastCoverKey = coverKey;
                     PublishRead(track);
                     if (wasWaitingForFirstCover)
@@ -194,6 +231,9 @@ public sealed class TrackMonitor : IDisposable
                 return;
             }
 
+            // Different songs may legitimately share album artwork. After the bounded
+            // settle window, publish the new identity and briefly check for late artwork.
+            _sharedCoverRefreshPollsRemaining = coverKey == _lastCoverKey ? SharedCoverRefreshPolls : 0;
             _lastTrackKey = trackKey;
             _lastCoverKey = coverKey;
             _pendingTrackKey = null;
@@ -203,6 +243,7 @@ public sealed class TrackMonitor : IDisposable
         }
 
         PublishRead(track);
+        _sharedCoverRefreshPollsRemaining = 0;
         _lastTrackKey = trackKey;
         _lastCoverKey = coverKey;
         TrackRefreshed?.Invoke(this, track);
@@ -312,6 +353,10 @@ public sealed class TrackMonitor : IDisposable
     private Task<TrackInfo?> ReadCurrentTrackAsync(bool includeCover, CancellationToken cancellationToken)
     {
         _stableMetadataOnlyPolls = includeCover ? 0 : _stableMetadataOnlyPolls + 1;
+        if (includeCover && _sharedCoverRefreshPollsRemaining > 0)
+        {
+            _sharedCoverRefreshPollsRemaining--;
+        }
         return _mediaSessionService.GetCurrentTrackAsync(
             includeCover ? MediaSessionReadOptions.Full : MediaSessionReadOptions.MetadataOnly,
             cancellationToken);
@@ -321,6 +366,7 @@ public sealed class TrackMonitor : IDisposable
     {
         return _lastStableTrack == null ||
                _pendingTrackKey != null ||
+               _sharedCoverRefreshPollsRemaining > 0 ||
                _stableMetadataOnlyPolls >= StableCoverRefreshPolls;
     }
 
@@ -370,8 +416,20 @@ public sealed class TrackMonitor : IDisposable
 
     private void PublishRead(TrackInfo track)
     {
+        bool sameTrack = HasSameSourceAndTitle(_lastPublishedTrack, track);
+        bool restoredSameTrack = _restoreNotificationPending && sameTrack && HasCover(track);
+        if (restoredSameTrack || !sameTrack)
+        {
+            _restoreNotificationPending = false;
+        }
         _lastStableTrack = track;
+        _lastPublishedTrack = track;
+        _isUnavailable = false;
         TrackRead?.Invoke(this, track);
+        if (restoredSameTrack)
+        {
+            TrackRestored?.Invoke(this, track);
+        }
     }
 
     private TrackInfo RestoreStableCoverIfMetadataOnly(TrackInfo track)
@@ -418,18 +476,6 @@ public sealed class TrackMonitor : IDisposable
         return track with { CoverBytes = null };
     }
 
-    private static TrackInfo RemovePreviousCover(TrackInfo track, string? previousCoverKey)
-    {
-        if (track.CoverBytes is { Length: > 0 } &&
-            !string.IsNullOrEmpty(previousCoverKey) &&
-            CreateCoverKey(track) == previousCoverKey)
-        {
-            return track with { CoverBytes = null };
-        }
-
-        return track;
-    }
-
     private static bool IsReadyToDisplay(TrackInfo track, string? previousCoverKey)
     {
         bool hasCurrentCover =
@@ -459,10 +505,15 @@ public sealed class TrackMonitor : IDisposable
 
     private bool IsMetadataRefresh(TrackInfo track)
     {
-        return _lastStableTrack != null &&
-               _lastStableTrack.SourceAppId.Equals(track.SourceAppId, StringComparison.OrdinalIgnoreCase) &&
-               _lastStableTrack.Title.Equals(track.Title, StringComparison.OrdinalIgnoreCase) &&
-               !_lastStableTrack.Artist.Equals(track.Artist, StringComparison.OrdinalIgnoreCase);
+        return HasSameSourceAndTitle(_lastPublishedTrack, track) &&
+               !_lastPublishedTrack!.Artist.Equals(track.Artist, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasSameSourceAndTitle(TrackInfo? previous, TrackInfo track)
+    {
+        return previous != null &&
+               previous.SourceAppId.Equals(track.SourceAppId, StringComparison.OrdinalIgnoreCase) &&
+               previous.Title.Equals(track.Title, StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsPlaceholderText(string value)

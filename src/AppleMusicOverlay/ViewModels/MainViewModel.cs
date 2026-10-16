@@ -80,6 +80,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public void ApplyTrack(TrackInfo? track)
     {
+        UpdateCaptureSourceTrack(track);
         if (HasSameVisibleTrackState(_currentTrack, track))
         {
             _currentTrack = track;
@@ -153,6 +154,25 @@ public sealed class MainViewModel : INotifyPropertyChanged
         OnPropertyChanged(nameof(CaptureSources));
     }
 
+    private void UpdateCaptureSourceTrack(TrackInfo? track)
+    {
+        if (track == null)
+        {
+            return;
+        }
+
+        foreach (MediaSessionSourceOption source in CaptureSources)
+        {
+            if (!source.SourceAppUserModelId.Equals(track.SourceAppId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            source.UpdateTrack(track);
+            return;
+        }
+    }
+
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
@@ -172,15 +192,66 @@ public sealed class MainViewModel : INotifyPropertyChanged
     }
 }
 
-public sealed record MediaSessionSourceOption(string SourceAppUserModelId, string DisplayName)
+public sealed class MediaSessionSourceOption : INotifyPropertyChanged
 {
+    private string _displayName;
+
+    public MediaSessionSourceOption(string sourceAppUserModelId, string displayName)
+    {
+        SourceAppUserModelId = sourceAppUserModelId;
+        _displayName = displayName;
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public string SourceAppUserModelId { get; }
+
+    public string DisplayName
+    {
+        get => _displayName;
+        private set
+        {
+            if (string.Equals(_displayName, value, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _displayName = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplayName)));
+        }
+    }
+
     public static MediaSessionSourceOption Automatic => new(string.Empty, LocalizationService.Current.Text("AutoSelect"));
 
     public static MediaSessionSourceOption FromCandidate(MediaSessionCandidate candidate)
     {
-        string title = string.IsNullOrWhiteSpace(candidate.Title) ? LocalizationService.Current.Text("UnknownMedia") : candidate.Title;
-        string source = SimplifySourceName(candidate.SourceAppUserModelId);
-        return new MediaSessionSourceOption(candidate.SourceAppUserModelId, $"{source} · {title}");
+        return Create(candidate.SourceAppUserModelId, candidate.Title);
+    }
+
+    public void UpdateTrack(TrackInfo track)
+    {
+        if (!SourceAppUserModelId.Equals(track.SourceAppId, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        DisplayName = CreateDisplayName(track.SourceAppId, track.Title);
+    }
+
+    private static MediaSessionSourceOption Create(string sourceAppUserModelId, string title)
+    {
+        return new MediaSessionSourceOption(
+            sourceAppUserModelId,
+            CreateDisplayName(sourceAppUserModelId, title));
+    }
+
+    private static string CreateDisplayName(string sourceAppUserModelId, string title)
+    {
+        string displayTitle = string.IsNullOrWhiteSpace(title)
+            ? LocalizationService.Current.Text("UnknownMedia")
+            : title.Trim();
+        string source = SimplifySourceName(sourceAppUserModelId);
+        return $"{source} · {displayTitle}";
     }
 
     private static string SimplifySourceName(string sourceAppUserModelId)

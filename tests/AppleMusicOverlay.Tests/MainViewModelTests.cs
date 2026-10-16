@@ -75,4 +75,40 @@ public sealed class MainViewModelTests
 
         Assert.Empty(changedProperties);
     }
+
+    [Fact]
+    public void ApplyTrackUpdatesMatchingCaptureSourceTitle()
+    {
+        var settingsPath = Path.Combine(Path.GetTempPath(), "AppleMusicOverlay.Tests", Guid.NewGuid().ToString("N"), "settings.json");
+        var viewModel = new MainViewModel(new OverlaySettingsService(settingsPath));
+        const string sourceId = "AppleInc.AppleMusicWin_nzyj5cx40ttqa!App";
+        viewModel.ReplaceCaptureSources(
+        [
+            new MediaSessionCandidate(sourceId, "Old Song", "Artist", true, true, 0),
+            new MediaSessionCandidate("Chrome", "Video", "Browser", true, false, 1)
+        ]);
+        viewModel.CaptureSourceAppUserModelId = sourceId;
+        MediaSessionSourceOption originalSource = Assert.Single(
+            viewModel.CaptureSources,
+            option => option.SourceAppUserModelId == sourceId);
+        var sourcePropertyChanges = new List<string?>();
+        originalSource.PropertyChanged += (_, args) => sourcePropertyChanges.Add(args.PropertyName);
+
+        viewModel.ApplyTrack(new TrackInfo(
+            "Current Song",
+            "Artist",
+            null,
+            sourceId,
+            TimeSpan.FromMinutes(3),
+            true));
+
+        MediaSessionSourceOption source = Assert.Single(
+            viewModel.CaptureSources,
+            option => option.SourceAppUserModelId == sourceId);
+        Assert.Same(originalSource, source);
+        Assert.Equal($"{sourceId} · Current Song", source.DisplayName);
+        Assert.Equal("Google Chrome · Video", viewModel.CaptureSources[2].DisplayName);
+        Assert.Equal(sourceId, viewModel.CaptureSourceAppUserModelId);
+        Assert.Contains(nameof(MediaSessionSourceOption.DisplayName), sourcePropertyChanges);
+    }
 }
